@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+
+# Runtime/session artifacts
+hubspot-session.json
+llm_preview.txt
+
+# Generated exports/reports
+resumos_hubspot.json
+resumo_comercial_semanal.md
+
+# Debug captures
+hubspot_deals_debug.html
+hubspot_record_debug.html
+timeline_debug.html
