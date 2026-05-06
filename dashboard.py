@@ -1605,6 +1605,84 @@ def send_to_telegram(messages: str | list[str]) -> None:
             raise RuntimeError(f"Erro Telegram HTTP {resp.status_code}: {resp.text[:300]}")
 
 
+def send_to_slack(messages: str | list[str]) -> None:
+    bot_token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    channel = os.getenv("SLACK_CHANNEL", "teste").strip()
+
+    if not bot_token or not channel:
+        raise RuntimeError("Defina SLACK_BOT_TOKEN e SLACK_CHANNEL no .env")
+
+    url = "https://slack.com/api/chat.postMessage"
+    payloads = messages if isinstance(messages, list) else [messages]
+    headers = {
+        "Authorization": f"Bearer {bot_token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    channel_target = resolve_slack_channel(bot_token, channel)
+    for message in payloads:
+        resp = requests.post(
+            url,
+            headers=headers,
+            json={
+                "channel": channel_target,
+                "text": shorten(message, 3900),
+                "unfurl_links": False,
+                "unfurl_media": False,
+            },
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Erro Slack HTTP {resp.status_code}: {resp.text[:300]}")
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Erro Slack API: {data.get('error', 'resposta sem ok')}")
+
+
+def resolve_slack_channel(bot_token: str, channel: str) -> str:
+    value = (channel or "").strip()
+    if not value:
+        return value
+    if re.match(r"^[CGD][A-Z0-9]+$", value):
+        return value
+
+    wanted = value.lstrip("#").strip().lower()
+    headers = {"Authorization": f"Bearer {bot_token}"}
+    cursor = ""
+    for _ in range(10):
+        params = {
+            "exclude_archived": "true",
+            "limit": 1000,
+            "types": "public_channel,private_channel",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = requests.get(
+                "https://slack.com/api/conversations.list",
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+            data = resp.json()
+        except Exception:
+            break
+        if not data.get("ok"):
+            break
+        for item in data.get("channels") or []:
+            if (item.get("name") or "").strip().lower() == wanted:
+                return item.get("id") or value
+        cursor = ((data.get("response_metadata") or {}).get("next_cursor") or "").strip()
+        if not cursor:
+            break
+    return value if value.startswith("#") else f"#{wanted}"
+
+
+def remember_last_summary(summary_messages: list[str], summary_meta: dict, filters: dict) -> None:
+    st.session_state["last_summary"] = ("\n\n" + ("=" * 48) + "\n\n").join(summary_messages)
+    st.session_state["last_summary_meta"] = summary_meta
+    st.session_state["last_summary_filters"] = filters
+
+
 def inject_styles():
     st.markdown(
         """
@@ -1746,9 +1824,10 @@ def main():
             st.caption("Abre o login manual do HubSpot e executa `python script.py --refresh-session` neste ambiente.")
         st.divider()
         st.subheader("Resumo Executivo")
-        send_btn = st.button("Gerar resumo e enviar Telegram", use_container_width=True, disabled=not bool(data))
+        send_telegram_btn = st.button("Gerar resumo e enviar Telegram", use_container_width=True, disabled=not bool(data))
+        send_slack_btn = st.button("Gerar resumo e enviar Slack", use_container_width=True, disabled=not bool(data))
         st.caption("Briefing executivo estruturado por negocio, gerado por LLM a partir do contexto comercial capturado.")
-        st.caption("Variaveis no .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+        st.caption("Variaveis no .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SLACK_BOT_TOKEN, SLACK_CHANNEL")
         st.divider()
         st.subheader("Modelo LLM")
         st.caption(f"Modelo configurado agora: {preferred_summary_backend_label()}")
@@ -1825,31 +1904,32 @@ def main():
         st.error("Arquivo resumos_hubspot.json nao encontrado ou vazio.")
         return
 
-    if send_btn:
-        if not filtered:
-            st.warning("Nao ha negocios no filtro atual para gerar resumo.")
-        else:
-            with st.spinner("Gerando resumo negocio a negocio e enviando para Telegram..."):
-                try:
-                    summary_messages, summary_meta = build_director_summary_messages(filtered)
-                    send_to_telegram(summary_messages)
-                    st.success("Resumo enviado para o Telegram com sucesso.")
-                except Exception as exc:
-                    st.error(f"Falha ao gerar ou enviar resumo com LLM: {exc}")
-                else:
-                    st.session_state["last_summary"] = ("\n\n" + ("=" * 48) + "\n\n").join(summary_messages)
-                    st.session_state["last_summary_meta"] = summary_meta
-                    st.session_state["last_summary_filters"] = {
-                        "stages": sorted(sel_stages),
-                        "owners": sorted(sel_owners),
-                        "risks": sorted(sel_risks),
-                    }
-
-    current_filters = {
+    summary_filters = {
         "stages": sorted(sel_stages),
         "owners": sorted(sel_owners),
         "risks": sorted(sel_risks),
     }
+
+    if send_telegram_btn or send_slack_btn:
+        if not filtered:
+            st.warning("Nao ha negocios no filtro atual para gerar resumo.")
+        else:
+            destination = "Telegram" if send_telegram_btn else "Slack"
+            with st.spinner(f"Gerando resumo negocio a negocio e enviando para {destination}..."):
+                try:
+                    summary_messages, summary_meta = build_director_summary_messages(filtered)
+                    if send_telegram_btn:
+                        send_to_telegram(summary_messages)
+                        st.success("Resumo enviado para o Telegram com sucesso.")
+                    else:
+                        send_to_slack(summary_messages)
+                        st.success("Resumo enviado para o Slack com sucesso.")
+                except Exception as exc:
+                    st.error(f"Falha ao gerar ou enviar resumo para {destination}: {exc}")
+                else:
+                    remember_last_summary(summary_messages, summary_meta, summary_filters)
+
+    current_filters = summary_filters
     if st.session_state.get("last_summary_filters") != current_filters:
         st.session_state.pop("last_summary", None)
         st.session_state.pop("last_summary_meta", None)
